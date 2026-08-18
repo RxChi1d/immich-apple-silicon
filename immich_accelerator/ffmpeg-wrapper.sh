@@ -33,7 +33,35 @@ else
 fi
 
 ARGS=("$@")
+# USE_HW gates hardware *decoding* (-hwaccel videotoolbox); USE_VTENC gates
+# hardware *encoding*. Splitting them allows the combination that actually
+# serves a photo library: decode on the media engine, encode in software.
+#
+# Transcoding to 720p on an M1 Air, matched on SSIM against the downscaled
+# source, hardware encoding costs 2.2x the bitrate and is not even faster:
+#
+#     libx264 -preset veryfast -crf 23   0.75 Mbps   SSIM 0.9544   379% CPU
+#     h264_videotoolbox -q:v 55          1.62 Mbps   SSIM 0.9546   279% CPU
+#
+# The gap is not a thermal artifact of a short run. Held at full load for ten
+# minutes on the fanless Air, libx264 settled 4.4% below its opening rate
+# (345 -> 330 fps) while VideoToolbox stayed flat (311 -> 314 fps), and macOS
+# recorded no thermal warning at all. Software still finished ahead: 11.4x
+# realtime sustained against 10.7x.
+#
+# HEVC behaves the same way, more so: libx265 -preset veryfast -crf 28 gives
+# 0.35 Mbps against hevc_videotoolbox -q:v 55 at 1.01 Mbps, same SSIM.
+#
+# Keep the decode side hardware regardless. Dropping -hwaccel videotoolbox
+# along with the encoder remap took the same software encode from 379% CPU to
+# 751%, because decoding 1920x1440 HEVC in software dominates everything else.
+#
+# Set IMMICH_ACCELERATOR_SW_ENCODE=0 for the original all-VideoToolbox
+# behavior: one fewer core busy, at 2.2x the file size.
+SW_ENCODE="${IMMICH_ACCELERATOR_SW_ENCODE:-1}"
+
 USE_HW=false
+USE_VTENC=false
 USE_HEVC=false
 HAS_HEVC_TAG=false
 NEW_ARGS=()
@@ -41,18 +69,29 @@ NEW_ARGS=()
 for ((i=0; i<${#ARGS[@]}; i++)); do
     arg="${ARGS[$i]}"
 
-    # Remap software encoders to VideoToolbox hardware encoders
+    # Remap Immich's encoder request. Either way this is a video encode, so
+    # turn on hardware decoding; only the encoder itself is conditional.
     if [[ "$arg" == "-c:v" || "$arg" == "-vcodec" ]]; then
         next="${ARGS[$((i+1))]:-}"
         case "$next" in
             h264|libx264|libx264rgb)
-                NEW_ARGS+=("$arg" "h264_videotoolbox")
+                if [[ "$SW_ENCODE" == "1" ]]; then
+                    NEW_ARGS+=("$arg" "libx264")
+                else
+                    NEW_ARGS+=("$arg" "h264_videotoolbox")
+                    USE_VTENC=true
+                fi
                 ((i++))
                 USE_HW=true
                 continue
                 ;;
             hevc|libx265)
-                NEW_ARGS+=("$arg" "hevc_videotoolbox")
+                if [[ "$SW_ENCODE" == "1" ]]; then
+                    NEW_ARGS+=("$arg" "libx265")
+                else
+                    NEW_ARGS+=("$arg" "hevc_videotoolbox")
+                    USE_VTENC=true
+                fi
                 ((i++))
                 USE_HW=true
                 USE_HEVC=true
@@ -61,8 +100,10 @@ for ((i=0; i<${#ARGS[@]}; i++)); do
         esac
     fi
 
-    # Strip -preset for VideoToolbox (doesn't support CPU presets)
-    if [[ "$arg" == "-preset" && "$USE_HW" == true ]]; then
+    # Strip -preset for VideoToolbox (doesn't support CPU presets). Under
+    # software encoding libx264 wants it, and it is the only reason Immich's
+    # own preset setting has any effect at all on this platform.
+    if [[ "$arg" == "-preset" && "$USE_VTENC" == true ]]; then
         ((i++))
         continue
     fi
@@ -78,6 +119,7 @@ if [[ "$USE_HW" == true ]]; then
     # hev1 (ffmpeg default) stores parameter sets in-band — Apple's
     # decoder rejects it. Immich usually passes -tag:v hvc1 itself,
     # but if it's absent we inject it before the output filename.
+    # libx265 defaults to hev1 as well, so this applies to both encoders.
     if [[ "$USE_HEVC" == true && "$HAS_HEVC_TAG" == false ]]; then
         len=${#NEW_ARGS[@]}
         LAST="${NEW_ARGS[$((len-1))]}"
