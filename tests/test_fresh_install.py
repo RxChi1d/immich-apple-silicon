@@ -2132,7 +2132,13 @@ class TestFfmpegWrapperQuickLookFallback:
     def test_hardware_encoder_remap_still_applies(self, tmp_path):
         """Regression check: restructuring `exec` into a captured run (so the
         wrapper can inspect ffmpeg's exit code) must not disturb the
-        pre-existing VideoToolbox encoder remap."""
+        VideoToolbox encoder remap.
+
+        The remap is now opt-in rather than unconditional — software encoding
+        is the default because it produces ~2.2x smaller files at equal SSIM —
+        so this drives the hardware path explicitly. What it guards is
+        unchanged: when VideoToolbox IS selected, the encoder is swapped and
+        the software preset is dropped."""
         ffmpeg = tmp_path / "ffmpeg"
         seen_args = tmp_path / "seen_args"
         self._bash_stub(ffmpeg, f'printf "%s\\n" "$@" > {seen_args}\nexit 0\n')
@@ -2141,7 +2147,10 @@ class TestFfmpegWrapperQuickLookFallback:
         result = subprocess.run(
             ["/bin/bash", str(wrapper), "-i", str(tmp_path / "in.mov"),
              "-c:v", "libx264", "-preset", "fast", str(tmp_path / "out.mp4")],
-            env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
+            env={
+                "PATH": f"{tmp_path}:/usr/bin:/bin",
+                "IMMICH_ACCELERATOR_SW_ENCODE": "0",
+            },
             capture_output=True,
             text=True,
             timeout=10,
@@ -2498,3 +2507,115 @@ class TestJobRetryShim:
         # past where run1 left off instead of restarting at the same value.
         assert "DELAY:4000" in run1.stdout, run1.stdout
         assert "DELAY:4000" in run2.stdout, run2.stdout
+
+
+class TestFfmpegWrapperEncoderSelection:
+    """Which encoder the wrapper actually asks for, and what it does to the
+    surrounding flags. Immich only ever emits software encoder names, so every
+    hardware decision is made here; these drive the wrapper with a stub ffmpeg
+    that records its argv.
+
+    Software encoding is the default because at matched quality it is
+    dramatically cheaper in bitrate: measured on an M1 transcoding to 720p,
+    libx264 -preset veryfast -crf 23 gave 0.75 Mbps at SSIM 0.9544, while
+    h264_videotoolbox -q:v 55 needed 1.62 Mbps for the same SSIM 0.9546.
+    """
+
+    WRAPPER = REPO_ROOT / "immich_accelerator" / "ffmpeg-wrapper.sh"
+
+    def _prepare(self, tmp_path):
+        """Stub ffmpeg records argv; wrapper is deployed the way __main__.py
+        deploys it (REAL_FFMPEG substituted in)."""
+        argv_log = tmp_path / "argv.txt"
+        ffmpeg = tmp_path / "ffmpeg"
+        ffmpeg.write_text(
+            '#!/bin/bash\nprintf "%s\\n" "$@" > ' + str(argv_log) + "\nexit 0\n"
+        )
+        ffmpeg.chmod(0o755)
+        content = self.WRAPPER.read_text().replace(
+            'REAL_FFMPEG="/opt/homebrew/bin/ffmpeg"',
+            f'REAL_FFMPEG="{ffmpeg}"',
+        )
+        wrapper = tmp_path / "ffmpeg-wrapper-under-test.sh"
+        wrapper.write_text(content)
+        wrapper.chmod(0o755)
+        return wrapper, argv_log
+
+    def _run(self, tmp_path, args, env_extra=None):
+        wrapper, argv_log = self._prepare(tmp_path)
+        env = {"PATH": f"{tmp_path}:/usr/bin:/bin"}
+        env.update(env_extra or {})
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper), *args],
+            env=env, capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        return argv_log.read_text().splitlines()
+
+    # Shaped like Immich's BaseConfig output for an H.264 target with
+    # default settings (preset ultrafast, crf 23, maxBitrate 0).
+    def _h264_args(self, tmp_path, codec="h264"):
+        return [
+            "-i", str(tmp_path / "in.mov"),
+            "-c:v", codec, "-c:a", "aac",
+            "-vf", "scale=-2:720",
+            "-preset", "ultrafast", "-crf", "23",
+            str(tmp_path / "out.mp4"),
+        ]
+
+    def test_defaults_to_libx264_and_keeps_preset(self, tmp_path):
+        argv = self._run(tmp_path, self._h264_args(tmp_path))
+        assert "libx264" in argv
+        assert "h264_videotoolbox" not in argv
+        # -preset is what makes Immich's own preset setting mean anything;
+        # stripping it here is exactly the bug this change fixes.
+        assert "-preset" in argv and "ultrafast" in argv
+
+    def test_hardware_decode_stays_on_under_software_encode(self, tmp_path):
+        """Dropping -hwaccel along with the encoder remap doubled CPU
+        (379% -> 751% measured); decode must stay on the media engine."""
+        argv = self._run(tmp_path, self._h264_args(tmp_path))
+        assert "-hwaccel" in argv
+        assert argv[argv.index("-hwaccel") + 1] == "videotoolbox"
+
+    def test_opt_out_restores_videotoolbox_encoding(self, tmp_path):
+        argv = self._run(
+            tmp_path, self._h264_args(tmp_path),
+            env_extra={"IMMICH_ACCELERATOR_SW_ENCODE": "0"},
+        )
+        assert "h264_videotoolbox" in argv
+        assert "libx264" not in argv
+        # VideoToolbox rejects -preset outright, so it must still be stripped.
+        assert "-preset" not in argv and "ultrafast" not in argv
+
+    def test_libx264_request_is_also_recognised(self, tmp_path):
+        """Immich emits the bare codec name, but the wrapper has always
+        accepted the library name too; software mode must not turn that into
+        a no-op that silently leaves the arg list untouched."""
+        argv = self._run(tmp_path, self._h264_args(tmp_path, codec="libx264"))
+        assert "libx264" in argv
+        assert "-hwaccel" in argv
+
+    def test_hevc_target_gets_hvc1_tag_under_software_encode(self, tmp_path):
+        """libx265 defaults to the hev1 tag, which Apple's decoder rejects —
+        the same reason the tag is injected for hevc_videotoolbox."""
+        argv = self._run(tmp_path, [
+            "-i", str(tmp_path / "in.mov"),
+            "-c:v", "hevc", "-c:a", "aac",
+            str(tmp_path / "out.mp4"),
+        ])
+        assert "libx265" in argv
+        assert "-tag:v" in argv and "hvc1" in argv
+        # ...and the tag must precede the output path, not follow it.
+        assert argv.index("hvc1") < argv.index(str(tmp_path / "out.mp4"))
+
+    def test_thumbnail_extraction_is_left_alone(self, tmp_path):
+        """Still-image output asks for no video codec the wrapper handles, so
+        nothing should be rewritten and no hardware decode forced on."""
+        argv = self._run(tmp_path, [
+            "-i", str(tmp_path / "in.mov"),
+            "-frames:v", "1", "-vf", "scale=-2:250",
+            "-f", "image2", str(tmp_path / "out.jpg"),
+        ])
+        assert "-hwaccel" not in argv
+        assert "libx264" not in argv and "h264_videotoolbox" not in argv
