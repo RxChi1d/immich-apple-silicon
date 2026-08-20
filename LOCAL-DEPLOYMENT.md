@@ -106,21 +106,28 @@ grep -o 'SW_ENCODE="${IMMICH_ACCELERATOR_SW_ENCODE:-[01]}"' ~/.immich-accelerato
 wrapper 把 `USE_HW`（硬體**解碼**）和 `USE_VTENC`（硬體**編碼**）拆開，
 讓解碼留在媒體引擎、編碼走 libx264。
 
-M1 Air 上轉 720p，以縮放後的原檔為基準對齊 SSIM：
+選軟體編碼是為了位元效率，不是為了速度。
 
-```
-libx264 -preset veryfast -crf 23    0.75 Mbps   SSIM 0.9544   379% CPU
-h264_videotoolbox -q:v 55           1.62 Mbps   SSIM 0.9546   279% CPU
-```
+六支素材、五種指標（SSIM、MS-SSIM、LPIPS-AlexNet、LPIPS-VGG、DISTS）對齊畫質後，
+`h264_videotoolbox` 需要 `libx264 -preset veryfast` 的 **1.7–3.2 倍**位元；
+`hevc_videotoolbox` 對 `libx265 -preset veryfast` 約 **2.0 倍**。
 
-同畫質下硬體編碼要 2.2 倍位元率，而且不比較快。持續滿載十分鐘，
-libx264 從 345 掉到 330 fps（-4.4%），VideoToolbox 從 311 到 314 fps 持平，
-macOS 沒有記錄任何過熱警告 —— 軟體仍然勝出（11.4x vs 10.7x realtime）。
+比較時兩邊都必須加 `-pix_fmt yuv420p`。不指定的話，10-bit 來源會讓 x264 編出
+High 10 profile 而 VideoToolbox 退回 8-bit，兩邊編的不是同一份像素。
+
+CPU 這一側 VideoToolbox 較省，幅度取決於解碼負擔：4K60 HEVC 是解碼受限，
+軟編只多 11% CPU（9.61s 對 10.65s）；1080p SDR 則多約 2.4 倍（1.94s 對 4.15–4.83s）。
+
+**不要宣稱軟編比較快。** 無風扇 Air 持續滿載十分鐘，兩者都沒有降頻、
+macOS 也沒有記錄任何過熱或效能警告，但 VideoToolbox 的持續吞吐較高
+（230 fps 對 203 fps）。短時間量測可能得到相反結果，因為 VideoToolbox
+有一次性的 session 建立成本，跑久了會被平均掉。
 
 解碼那半一定要保留硬體：把 `-hwaccel videotoolbox` 一起拿掉，
-同一個軟體編碼從 379% CPU 變成 751%，因為軟解 1920x1440 HEVC 蓋過其他所有成本。
+同一個軟體編碼的 4K60 HEVC 工作從 10.77s CPU 變成 47.07s（4.4 倍），
+wall-clock 從 3.48s 變成 6.23s。
 
-`IMMICH_ACCELERATOR_SW_ENCODE=0` 可以退回全 VideoToolbox。
+`IMMICH_ACCELERATOR_SW_ENCODE=0` 可以退回全 VideoToolbox：CPU 較省，檔案約兩倍大。
 
 ---
 

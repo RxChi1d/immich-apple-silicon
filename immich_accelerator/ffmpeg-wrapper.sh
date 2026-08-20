@@ -37,27 +37,32 @@ ARGS=("$@")
 # hardware *encoding*. Splitting them allows the combination that actually
 # serves a photo library: decode on the media engine, encode in software.
 #
-# Transcoding to 720p on an M1 Air, matched on SSIM against the downscaled
-# source, hardware encoding costs 2.2x the bitrate and is not even faster:
+# Software encoding is chosen for bitrate efficiency, not for speed.
 #
-#     libx264 -preset veryfast -crf 23   0.75 Mbps   SSIM 0.9544   379% CPU
-#     h264_videotoolbox -q:v 55          1.62 Mbps   SSIM 0.9546   279% CPU
+# Matched on quality against the downscaled source over six clips and five
+# metrics (SSIM, MS-SSIM, LPIPS-AlexNet, LPIPS-VGG, DISTS), h264_videotoolbox
+# needs 1.7x to 3.2x the bits of libx264 -preset veryfast for the same result.
+# hevc_videotoolbox against libx265 -preset veryfast is about 2.0x. Both
+# encoders must be forced to -pix_fmt yuv420p to compare: left alone, x264
+# encodes a 10-bit source as High 10 while VideoToolbox falls back to 8-bit.
 #
-# The gap is not a thermal artifact of a short run. Held at full load for ten
-# minutes on the fanless Air, libx264 settled 4.4% below its opening rate
-# (345 -> 330 fps) while VideoToolbox stayed flat (311 -> 314 fps), and macOS
-# recorded no thermal warning at all. Software still finished ahead: 11.4x
-# realtime sustained against 10.7x.
+# VideoToolbox is cheaper in CPU, and by how much depends on the decode load.
+# On a 4K60 HEVC source the whole job is decode bound and software encoding
+# costs 11% more CPU (9.61s against 10.65s); on 1080p SDR it costs about 2.4x
+# (1.94s against 4.15-4.83s).
 #
-# HEVC behaves the same way, more so: libx265 -preset veryfast -crf 28 gives
-# 0.35 Mbps against hevc_videotoolbox -q:v 55 at 1.01 Mbps, same SSIM.
+# It is not a throughput win. Held at full load for ten minutes on the fanless
+# Air, neither encoder throttled and macOS recorded no thermal or performance
+# warning, but VideoToolbox sustained the higher rate (230 fps against 203).
+# Short runs can reverse that, because VideoToolbox pays a session setup cost
+# the average amortizes away.
 #
-# Keep the decode side hardware regardless. Dropping -hwaccel videotoolbox
-# along with the encoder remap took the same software encode from 379% CPU to
-# 751%, because decoding 1920x1440 HEVC in software dominates everything else.
+# Keep the decode side on hardware regardless. Dropping -hwaccel videotoolbox
+# took the same software encode of a 4K60 HEVC clip from 10.77s to 47.07s of
+# CPU, 4.4x, and the wall clock from 3.48s to 6.23s.
 #
 # Set IMMICH_ACCELERATOR_SW_ENCODE=0 for the original all-VideoToolbox
-# behavior: one fewer core busy, at 2.2x the file size.
+# behavior: less CPU, at roughly twice the file size.
 SW_ENCODE="${IMMICH_ACCELERATOR_SW_ENCODE:-1}"
 
 USE_HW=false
