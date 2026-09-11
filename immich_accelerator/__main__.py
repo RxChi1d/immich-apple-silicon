@@ -2417,8 +2417,45 @@ def mount_recipe_for(root: str) -> dict | None:
         for line in out.splitlines()
     ):
         return None
-    resolved = _resolve_offthread(root)
+    resolved = _resolve_for_mount_table(root, out)
     return _best_mount_for(resolved, out) if resolved and resolved != root else None
+
+
+# One entry, keyed on the mount table the answer was computed against.
+#
+# The guard above only skips the fork when the table holds no remountable mount
+# at all. One unrelated mount defeats it forever: an OrbStack install has a
+# permanent NFS mount at ~/OrbStack, so a library on a local disk matched no
+# mount, satisfied the guard anyway, and forked a resolver every 30s cycle for
+# an answer that was then discarded. Measured by the reporter at 119 spawns an
+# hour, indefinitely (#176).
+#
+# Keyed on the table rather than time because the table is exactly what can
+# change the answer: a path resolves onto a network mount only once that mount
+# exists. So this re-resolves promptly when it could matter and never otherwise.
+#
+# Only successful resolutions are stored. A failure means the resolver timed
+# out, which is what a mount whose server has gone away does, and that mount is
+# still listed in the table while it hangs. Caching that would answer "cannot
+# resolve" from then on against an unchanged table, so the watcher would never
+# look again once the server came back, and never remount it. Retrying is the
+# behaviour this module exists for, and it is bounded by the resolver timeout.
+_RESOLVED_FOR_TABLE: tuple[tuple[str, str], str] | None = None
+
+
+def _resolve_for_mount_table(root: str, out: str) -> str | None:
+    """_resolve_offthread(root), reused while the mount table is unchanged."""
+    global _RESOLVED_FOR_TABLE
+    key = (root, out)
+    # Read once. Two reads could take the key from one entry and the value from
+    # another if a second thread replaced it in between.
+    cached = _RESOLVED_FOR_TABLE
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    resolved = _resolve_offthread(root)
+    if resolved is not None:
+        _RESOLVED_FOR_TABLE = (key, resolved)
+    return resolved
 
 
 def _resolve_offthread(path: str, timeout: int = 5) -> str | None:
