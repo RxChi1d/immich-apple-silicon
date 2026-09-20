@@ -4258,3 +4258,114 @@ class TestNobodyAtTheKeyboardIsNotConsent:
             "these prompts treat an absent user as agreement, so an unattended "
             "setup would proceed with something nobody approved: " + ", ".join(offenders)
         )
+
+
+class TestSplitInstallVersionRouting:
+    """immich_url decides which Immich an install follows (#139).
+
+    A container on this Mac is a different server. It must not supply the
+    version a split install matches, and it must not supply the server files
+    for a version it does not itself hold — extract_immich_server names its
+    output after the version it is handed, so an unchecked container yields
+    files labelled with someone else's version.
+    """
+
+    SPLIT = {"immich_url": "http://immich.example:2283", "api_key": "k"}
+
+    def _stray_container(self, m, version="3.1.0"):
+        """A local Immich that has nothing to do with the configured one."""
+        return patch.object(m, "_find_running_docker", return_value="/usr/bin/docker"), patch.object(
+            m,
+            "detect_immich",
+            return_value={"version": version, "container": "immich_server"},
+        )
+
+    def test_split_takes_the_version_from_the_configured_immich(self):
+        # Docker must not be consulted at all, not merely lose a tie-break.
+        from immich_accelerator import __main__ as m
+
+        with patch.object(
+            m, "_find_running_docker", side_effect=AssertionError("must not be called")
+        ), patch.object(
+            m, "detect_immich", side_effect=AssertionError("must not be called")
+        ), patch.object(
+            m, "_query_immich_api", return_value={"version": "3.2.2"}
+        ):
+            assert m._authoritative_version(self.SPLIT) == "3.2.2"
+
+    def test_local_takes_the_version_from_docker(self):
+        from immich_accelerator import __main__ as m
+
+        docker, detect = self._stray_container(m, "3.1.0")
+        with docker, detect, patch.object(
+            m, "_query_immich_api", side_effect=AssertionError("must not be called")
+        ):
+            assert m._authoritative_version({}) == "3.1.0"
+
+    def test_split_without_an_api_key_has_no_source(self):
+        # The watcher already warns at startup that auto-update is off; the
+        # version check must then do nothing rather than fall back to Docker.
+        from immich_accelerator import __main__ as m
+
+        docker, detect = self._stray_container(m, "3.1.0")
+        with docker, detect, pytest.raises(RuntimeError):
+            m._authoritative_version({"immich_url": "http://immich.example:2283"})
+
+    def test_a_mismatched_container_is_not_used_for_files(self):
+        from immich_accelerator import __main__ as m
+
+        docker, detect = self._stray_container(m, "3.1.0")
+        downloaded = MagicMock(return_value=Path("/srv/3.2.2"))
+        with docker, detect, patch.object(
+            m, "extract_immich_server", side_effect=AssertionError("wrong version")
+        ), patch.object(m, "download_immich_server", downloaded):
+            assert m._server_build_for("3.2.2") == Path("/srv/3.2.2")
+        downloaded.assert_called_once_with("3.2.2")
+
+    def test_a_matching_container_still_saves_the_download(self):
+        from immich_accelerator import __main__ as m
+
+        docker, detect = self._stray_container(m, "3.2.2")
+        extracted = MagicMock(return_value=Path("/srv/3.2.2"))
+        with docker, detect, patch.object(
+            m, "extract_immich_server", extracted
+        ), patch.object(
+            m, "download_immich_server", side_effect=AssertionError("had it locally")
+        ):
+            assert m._server_build_for("3.2.2") == Path("/srv/3.2.2")
+        assert extracted.call_args[0][1] == "immich_server"
+
+    def test_a_rollback_is_named_as_one(self):
+        # Followed either way, but logged distinctly so it is greppable.
+        from immich_accelerator import __main__ as m
+
+        assert m._is_rollback("3.2.2", "3.1.0")
+        assert not m._is_rollback("3.1.0", "3.2.2")
+        assert not m._is_rollback("3.2.2", "3.2.2")
+        assert not m._is_rollback("", "3.2.2")
+        assert not m._is_rollback("unknown", "3.2.2")
+
+    def test_a_dead_registry_fails_as_a_runtime_error(self):
+        # The watcher stops the worker before calling this and catches
+        # RuntimeError only: a raw URLError would end the watch loop with the
+        # worker off and the new version unsaved.
+        from immich_accelerator import __main__ as m
+        import urllib.error
+
+        with patch.object(
+            m, "_find_running_docker", side_effect=RuntimeError("no docker")
+        ), patch.object(
+            m, "download_immich_server", side_effect=urllib.error.URLError("ghcr down")
+        ), pytest.raises(RuntimeError, match="Could not download server"):
+            m._server_build_for("3.2.2")
+
+    def test_a_stalled_immich_fails_as_a_runtime_error(self):
+        # urlopen's timeout covers the connect; the read raises TimeoutError,
+        # which is not a URLError. Same for a proxy's HTML error page.
+        from immich_accelerator import __main__ as m
+
+        for boom in (TimeoutError("read timed out"), ValueError("not json")):
+            with patch("urllib.request.urlopen", side_effect=boom), pytest.raises(
+                RuntimeError, match="Could not reach Immich"
+            ):
+                m._query_immich_api("http://immich.example:2283", "k")
