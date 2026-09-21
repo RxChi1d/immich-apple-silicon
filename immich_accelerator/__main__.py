@@ -3768,11 +3768,20 @@ def _server_build_for(version: str) -> Path:
                 f"local Immich container is {immich['version']}, need {version}"
             )
         return extract_immich_server(docker, immich["container"], version)
-    except RuntimeError as e:
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        # Extraction fails in more ways than RuntimeError: it makes directories,
+        # clears stale ones and shells out, so a hung `docker cp` raises
+        # TimeoutExpired and a full disk OSError. Those used to escape the
+        # registry fallback as well as the caller.
         log.info("Downloading server %s from ghcr.io (%s)", version, e)
         try:
             return download_immich_server(version)
-        except (OSError, ValueError, http.client.HTTPException) as err:
+        except (
+            OSError,
+            ValueError,
+            subprocess.SubprocessError,
+            http.client.HTTPException,
+        ) as err:
             # ghcr.io reaches urllib directly in there. Both callers stop the
             # services before calling this and catch RuntimeError only, so a
             # registry hiccup would otherwise take the watcher down with the

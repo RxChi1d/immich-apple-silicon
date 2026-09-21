@@ -4369,3 +4369,48 @@ class TestSplitInstallVersionRouting:
                 RuntimeError, match="Could not reach Immich"
             ):
                 m._query_immich_api("http://immich.example:2283", "k")
+
+    def test_update_runs_on_a_split_install_with_no_docker(self):
+        # cmd_update opened with _find_running_docker(), so it raised on a Mac
+        # that has none, and it copied the found container's database
+        # credentials into the config -- what #139 removed from cmd_start.
+        from immich_accelerator import __main__ as m
+
+        cfg = dict(self.SPLIT, version="3.1.0", db_password="mine", db_port=5432)
+        saved = {}
+        with patch.object(m, "load_config", return_value=dict(cfg)), patch.object(
+            m, "_find_running_docker", side_effect=RuntimeError("no docker")
+        ), patch.object(
+            m, "detect_immich", side_effect=AssertionError("read a container")
+        ), patch.object(
+            m, "_query_immich_api", return_value={"version": "3.2.2"}
+        ), patch.object(
+            m, "cmd_stop"
+        ), patch.object(
+            m, "download_immich_server", return_value=Path("/srv/3.2.2")
+        ), patch.object(
+            m, "save_config", side_effect=saved.update
+        ):
+            m.cmd_update(None)
+
+        assert saved["version"] == "3.2.2"
+        assert saved["server_dir"] == "/srv/3.2.2"
+        assert saved["db_password"] == "mine"
+
+    def test_a_hung_docker_cp_still_falls_back_to_the_registry(self):
+        # extract_immich_server shells out with a timeout and makes
+        # directories, so it raises TimeoutExpired and OSError as well as
+        # RuntimeError. Those used to escape the registry fallback entirely.
+        from immich_accelerator import __main__ as m
+
+        for boom in (
+            subprocess.TimeoutExpired("docker cp", 120),
+            OSError("No space left on device"),
+        ):
+            docker, detect = self._stray_container(m, "3.2.2")
+            downloaded = MagicMock(return_value=Path("/srv/3.2.2"))
+            with docker, detect, patch.object(
+                m, "extract_immich_server", side_effect=boom
+            ), patch.object(m, "download_immich_server", downloaded):
+                assert m._server_build_for("3.2.2") == Path("/srv/3.2.2")
+            downloaded.assert_called_once_with("3.2.2")
